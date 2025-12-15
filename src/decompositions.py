@@ -57,11 +57,12 @@ class RSVDProjector(SubspaceProjector):
         # TODO: Implement randomized SVD (using sklearn or torch approximation)
         pass
 
-class NMFProjector(SubspaceProjector):
+class MagnitudePruningProjector(SubspaceProjector):
     """
-    Implementation of Experiment 4 (Non-Negative Matrix Factorization) [cite: 51-55].
+    Baseline: Freezes weights based solely on magnitude. Serves as a control to test if geometric structure (SVD/QR) offers superior retention compared to simple sparsity.
     """
     def compute_subspaces(self, model):
-        # TODO: Handle non-negativity constraint (abs)
-        # TODO: Implement NMF logic
+        # TODO: Implement magnitude-based pruning logic
+        # TODO: Identify indices of smallest weights (update) vs largest weights (freeze)
+        # TODO: Create binary mask instead of projection matrix
         pass

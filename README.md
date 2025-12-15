@@ -1,7 +1,7 @@
 # Optimizing Subspace Constraints: Comparative Matrix Decomposition Techniques for Continual Learning in ResNet-18
 
 ## 🎯 Project Goal
-This is a research project comparing different mathematical techniques (Standard SVD, QR Decomposition, Randomized SVD, and NMF) to solve "Catastrophic Forgetting" in Neural Networks. It replicates and upgrades the methodology of the "Sculpting Subspaces" paper by replacing the core SVD engine with other decomposition methods.
+This is a research project comparing different mathematical techniques (Standard SVD, QR Decomposition, Randomized SVD, and Magnitude Pruning) to solve "Catastrophic Forgetting" in Neural Networks. It replicates and upgrades the methodology of the "Sculpting Subspaces" paper by replacing the core SVD engine with other decomposition methods.
 
 ## 🏗️ Architecture & File Structure
 
@@ -20,7 +20,7 @@ This is a research project comparing different mathematical techniques (Standard
     - **Crucial**: Modifies the output layer to support 10 classes even when training on the 5-class Task A, facilitating Continual Learning.
 - **`src/decompositions.py` (Phase 3 - The ❤️ of the Project)**:
     - Contains the `SubspaceProjector` abstract class.
-    - Implements **SVD**, **QR**, **NMF**, and **Randomized SVD**.
+    - Implements **SVD**, **QR**, **Magnitude Pruning**, and **Randomized SVD**.
     - Calculates the "Safe Subspaces" where weights are allowed to change.
 - **`src/trainer.py` (Phase 2 & 4)**: Contains custom training loops.
     - `train_baseline`: Standard training for the Expert model.
