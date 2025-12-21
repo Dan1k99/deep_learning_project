@@ -2,19 +2,28 @@ import torch
 import time
 
 def evaluate(model, loader, device):
-    """
-    Calculates accuracy on a given loader.
-    """
     model.eval()
     correct = 0
     total = 0
+    
+    # DEBUG: Track what the model is actually predicting
+    all_preds = []
+    all_labels = []
+    
     with torch.no_grad():
         for inputs, labels in loader:
             inputs, labels = inputs.to(device), labels.to(device)
             outputs = model(inputs)
             _, predicted = torch.max(outputs.data, 1)
+            
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
+            
+            # Collect first batch stats for debugging
+            if len(all_preds) == 0:
+                print(f"DEBUG - True Labels: {labels[:10].tolist()}")
+                print(f"DEBUG - Predicted:   {predicted[:10].tolist()}")
+
     return 100 * correct / total
 
 def train_baseline(model, train_loader, epochs, device, lr=0.001):
@@ -66,7 +75,7 @@ def train_constrained(model, train_loader, epochs, device, projector, lr=0.001):
             # --- INTERVENTION START [cite: 72] ---
             # Loop through layers and project gradients BEFORE optimizer step
             for name, param in model.named_parameters():
-                if param.grad is not None and "conv" in name: # Target conv layers
+                if param.grad is not None: # Apply to all relevant layers (Conv/Linear)
                      # Apply the cleaning function specific to the projector
                      projected_grad = projector.project_gradient(name, param.grad)
                      if projected_grad is not None:
