@@ -1,31 +1,31 @@
 import torch
 import time
 
-def evaluate(model, loader, device):
+def evaluate(model, loader, device, task_classes=None):
     model.eval()
     correct = 0
     total = 0
     
-    # DEBUG: Track what the model is actually predicting
-    all_preds = []
-    all_labels = []
-    
+
+
     with torch.no_grad():
         for inputs, labels in loader:
             inputs, labels = inputs.to(device), labels.to(device)
             outputs = model(inputs)
+
+            # MASKING LOGIC
+            if task_classes is not None:
+                mask = torch.full_like(outputs, float('-inf'))
+                mask[:, task_classes] = 0
+                outputs = outputs + mask
+
             _, predicted = torch.max(outputs.data, 1)
-            
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
             
-            # Collect first batch stats for debugging
-            if len(all_preds) == 0:
-                print(f"DEBUG - True Labels: {labels[:10].tolist()}")
-                print(f"DEBUG - Predicted:   {predicted[:10].tolist()}")
-
     return 100 * correct / total
 
+    
 def train_baseline(model, train_loader, epochs, device, lr=0.001):
     """
     Standard training loop for Task A (Phase 2) [cite: 23-26].
