@@ -133,8 +133,10 @@ class MagnitudePruningProjector(SubspaceProjector):
 class AdaptiveSVDProjector(SVDProjector):
     """
     Adaptive SVD: Dynamically selects rank based on layer importance (Input-Output Similarity).
+    [Fix 2]: Normalizes importance scores across layers to avoid excessive rank dropping.
+    [Fix 3]: Safe defaults (mrr=0.4) to protect feature extraction capability.
     """
-    def __init__(self, mrr=0.1, trr=0.9):
+    def __init__(self, mrr=0.4, trr=0.95):
         super().__init__()
         self.mrr = mrr # Minimum Retention Ratio (floor)
         self.trr = trr # Target Retention Ratio (ceiling)
@@ -143,8 +145,8 @@ class AdaptiveSVDProjector(SVDProjector):
     def compute_subspaces(self, model, dataloader, device):
         self.projections = {}
         
-        # --- Step A: Calculate Layer Importance ---
-        layer_importance = {}
+        # --- Step A: Collect Raw Importance Scores ---
+        raw_importance = {}
         hooks = []
         activations = {}
 
@@ -154,10 +156,11 @@ class AdaptiveSVDProjector(SVDProjector):
                 activations[name] = (input[0].detach(), output.detach())
             return hook
 
-        # 1. Register Loops
+        # 1. Register Hooks
         for name, module in model.named_modules():
             # We care about layers with weights that we decompose
             if isinstance(module, (nn.Linear, nn.Conv2d)):
+                # Note: We track module execution to get input/output
                 hooks.append(module.register_forward_hook(get_activation_hook(name + '.weight')))
 
         # 2. Run Single Batch
@@ -173,7 +176,8 @@ class AdaptiveSVDProjector(SVDProjector):
             for h in hooks:
                 h.remove()
 
-        # 4. Compute Importance
+        # 4. Compute Raw Similarity
+        valid_scores = []
         for name, (X, Y) in activations.items():
             # Handle Dimension Mismatches
             # Spatial Matching for CNN
@@ -189,30 +193,60 @@ class AdaptiveSVDProjector(SVDProjector):
                 X_flat = X_pooled.flatten().float()
                 Y_flat = Y_pooled.flatten().float()
                 
-                # Cosine Similarity: (A . B) / (|A| |B|)
+                # Cosine Similarity: Range [-1, 1]
                 similarity = torch.nn.functional.cosine_similarity(X_flat.unsqueeze(0), Y_flat.unsqueeze(0)).item()
-                # Normalize to [0, 1] if needed, but cosine is [-1, 1].
-                # We assume importance is absolute alignment or positive alignment.
-                # User prompted: "Ensure I_l is normalized between 0 and 1. If similarity is negative, consider using absolute value"
-                importance = abs(similarity)
+                # High Similarity = High Importance (Identity mapping = Keep it)
+                imp = abs(similarity)
+                
+                raw_importance[name] = imp
+                valid_scores.append(imp)
             else:
-                # Fallback for mismatched channels
-                importance = 1.0
+                # Mismatched channels (e.g. ResNet expansion)
+                # Mark as None for now, will fill with mean later
+                raw_importance[name] = None
+                
+        # --- Step B: Normalize & Calculate Rank ---
+        
+        # Calculate Mean of Valid Scores
+        if len(valid_scores) > 0:
+            avg_importance = sum(valid_scores) / len(valid_scores)
+        else:
+            avg_importance = 1.0 # Fallback safety
             
-            layer_importance[name] = importance
-            # print(f"Layer {name}: Importance={importance:.4f}")
+        print(f"Adaptive SVD: Avg Importance = {avg_importance:.4f} (over {len(valid_scores)} matching layers)")
 
-        # --- Step B & C: Adaptive Rank & SVD ---
         with torch.no_grad():
             for name, param in model.named_parameters():
-                if name in layer_importance:
-                    # Retrieve Importance
-                    imp = layer_importance[name]
+                if name in raw_importance:
+                    # Retrieve & Normalize
+                    raw = raw_importance[name]
+                    if raw is None:
+                        # Fallback for mismatched dimensions: Use Average Importance
+                        # Ideally, these are critical transform layers, so average is a safe neutral stance.
+                        # One could argure for raw=1.0, but average preserves the distribution center.
+                        norm_imp = 1.0 
+                    else:
+                        # Normalize: Relative importance compared to average
+                        norm_imp = raw / avg_importance
                     
                     # Calculate Adaptive Ratio
-                    # alpha = mrr + I * (trr - mrr)
-                    alpha = self.mrr + imp * (self.trr - self.mrr)
+                    # alpha = mrr + norm_imp * (trr - mrr)
+                    # Example: if norm_imp is 1.0 (average), we get something between mrr and trr?
+                    # Wait, if norm_imp is huge, we might exceed 1.0.
+                    # Formula logic: We want to scale [0, max_imp] -> [mrr, trr]
+                    # But the standard "Importance" papers usually use softmax or min-max normalization.
+                    # Given the user instruction: "final_importance[l] = raw_importance[l] / mean_importance"
+                    # And "r = mrr + final_importance[l] * (trr - mrr)"
                     
+                    alpha = self.mrr + norm_imp * (self.trr - self.mrr)
+                    
+                    # Clip to bounds [mrr, 1.0]
+                    # Note: We effectively allow alpha > trr if importance is very high, 
+                    # but we cap it at 1.0 (Full Rank).
+                    alpha = max(self.mrr, min(alpha, 1.0))
+                    
+                    # print(f"Layer {name}: Raw={raw if raw else 'N/A'}, Norm={norm_imp:.2f}, Alpha={alpha:.2f}")
+
                     # Flatten & SVD (Standard Logic)
                     W_flat = self._reshape_layer(param)
                     U, S, Vh = torch.linalg.svd(W_flat, full_matrices=False)
