@@ -129,3 +129,100 @@ class MagnitudePruningProjector(SubspaceProjector):
         # TODO: Identify indices of smallest weights (update) vs largest weights (freeze)
         # TODO: Create binary mask instead of projection matrix
         pass
+
+class AdaptiveSVDProjector(SVDProjector):
+    """
+    Adaptive SVD: Dynamically selects rank based on layer importance (Input-Output Similarity).
+    """
+    def __init__(self, mrr=0.1, trr=0.9):
+        super().__init__()
+        self.mrr = mrr # Minimum Retention Ratio (floor)
+        self.trr = trr # Target Retention Ratio (ceiling)
+        self.projections = {}
+
+    def compute_subspaces(self, model, dataloader, device):
+        self.projections = {}
+        
+        # --- Step A: Calculate Layer Importance ---
+        layer_importance = {}
+        hooks = []
+        activations = {}
+
+        def get_activation_hook(name):
+            def hook(model, input, output):
+                # Input is a tuple, take first element
+                activations[name] = (input[0].detach(), output.detach())
+            return hook
+
+        # 1. Register Loops
+        for name, module in model.named_modules():
+            # We care about layers with weights that we decompose
+            if isinstance(module, (nn.Linear, nn.Conv2d)):
+                hooks.append(module.register_forward_hook(get_activation_hook(name + '.weight')))
+
+        # 2. Run Single Batch
+        model.eval()
+        try:
+            with torch.no_grad():
+                # Get one batch
+                inputs, _ = next(iter(dataloader))
+                inputs = inputs.to(device)
+                model(inputs)
+        finally:
+            # 3. Cleanup Hooks (CRITICAL)
+            for h in hooks:
+                h.remove()
+
+        # 4. Compute Importance
+        for name, (X, Y) in activations.items():
+            # Handle Dimension Mismatches
+            # Spatial Matching for CNN
+            if X.dim() == 4 and Y.dim() == 4:
+                # Global Avg Pool: (B, C, H, W) -> (B, C)
+                X_pooled = X.mean(dim=(2, 3))
+                Y_pooled = Y.mean(dim=(2, 3))
+            else:
+                 X_pooled, Y_pooled = X, Y
+            
+            # Channel/Size Check
+            if X_pooled.numel() == Y_pooled.numel():
+                X_flat = X_pooled.flatten().float()
+                Y_flat = Y_pooled.flatten().float()
+                
+                # Cosine Similarity: (A . B) / (|A| |B|)
+                similarity = torch.nn.functional.cosine_similarity(X_flat.unsqueeze(0), Y_flat.unsqueeze(0)).item()
+                # Normalize to [0, 1] if needed, but cosine is [-1, 1].
+                # We assume importance is absolute alignment or positive alignment.
+                # User prompted: "Ensure I_l is normalized between 0 and 1. If similarity is negative, consider using absolute value"
+                importance = abs(similarity)
+            else:
+                # Fallback for mismatched channels
+                importance = 1.0
+            
+            layer_importance[name] = importance
+            # print(f"Layer {name}: Importance={importance:.4f}")
+
+        # --- Step B & C: Adaptive Rank & SVD ---
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if name in layer_importance:
+                    # Retrieve Importance
+                    imp = layer_importance[name]
+                    
+                    # Calculate Adaptive Ratio
+                    # alpha = mrr + I * (trr - mrr)
+                    alpha = self.mrr + imp * (self.trr - self.mrr)
+                    
+                    # Flatten & SVD (Standard Logic)
+                    W_flat = self._reshape_layer(param)
+                    U, S, Vh = torch.linalg.svd(W_flat, full_matrices=False)
+                    
+                    # Adaptive Rank Selection
+                    N_sv = len(S)
+                    k = int(alpha * N_sv)
+                    k = max(1, min(k, N_sv)) # Safety Bounds
+                    
+                    # Construct Projection
+                    U_keep = U[:, :k]
+                    V_keep = Vh[:k, :].T
+                    self.projections[name] = (U_keep, V_keep)
