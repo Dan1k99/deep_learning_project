@@ -84,4 +84,6 @@ def train_constrained(model, train_loader, epochs, device, projector, lr=0.001):
 
             optimizer.step() # Update with cleaned gradients [cite: 76]
             
+        print(f"Epoch {epoch+1}/{epochs} completed.")
+            
     return model
