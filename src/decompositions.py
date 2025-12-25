@@ -114,10 +114,7 @@ class QRProjector(SubspaceProjector):
         self.projections = {}
 
     def compute_subspaces(self, model, dataloader=None, device='cpu'):
-        print("Computing QR subspaces (Pivoted) using Scipy...")
-        import scipy.linalg
-        
-        # QR does not require data, only weights.
+        print("Computing QR subspaces (Pivoted)...")
         
         for name, param in model.named_parameters():
             if 'weight' in name and (param.dim() == 2 or param.dim() == 4):
@@ -125,22 +122,40 @@ class QRProjector(SubspaceProjector):
                 W = self._reshape_layer(param)
                 
                 # 2. Pivoted QR: W @ P = Q @ R
-                # We use scipy.linalg.qr because torch.linalg.qr(pivot=True) is version-dependent
-                W_np = W.detach().cpu().numpy()
-                Q_np, R_np, P_indices = scipy.linalg.qr(W_np, mode='economic', pivoting=True)
-                
-                # 3. Determine Rank
-                full_rank = min(W_np.shape)
-                k = int(self.rank_fraction * full_rank)
-                k = max(1, k) # Keep at least 1
-                
-                # 4. Truncate Q
-                # Q columns correspond to the pivoted basis vectors
-                Q_k = Q_np[:, :k]
-                
-                # 5. Form Projection Matrix: P = Q_k @ Q_k^T
-                # This projects onto the column space of the top-k components
-                P_proj_np = Q_k @ Q_k.T
+                try:
+                    # Try PyTorch (newer versions support pivot=True)
+                    # mode='reduced' returns Q (M, K), R (K, N)
+                    Q, R, P_indices = torch.linalg.qr(W.to(device), mode='reduced', pivot=True)
+                    
+                    # 3. Determine Rank
+                    full_rank = min(W.shape)
+                    k = int(self.rank_fraction * full_rank)
+                    k = max(1, k)
+                    
+                    # 4. Truncate Q
+                    Q_k = Q[:, :k]
+                    
+                    # 5. Form Projection Matrix
+                    P_proj = torch.mm(Q_k, Q_k.t())
+                    
+                    self.projections[name] = P_proj.to("cpu")
+
+                except TypeError:
+                     # Fallback for older PyTorch versions: Use Scipy
+                    if name == list(model.named_parameters())[0][0]: # Print only once
+                        print("Warning: torch.linalg.qr(pivot=True) not supported. Falling back to scipy.linalg.qr.")
+                    
+                    import scipy.linalg
+                    W_np = W.detach().cpu().numpy()
+                    Q_np, R_np, P_indices = scipy.linalg.qr(W_np, mode='economic', pivoting=True)
+                    
+                    full_rank = min(W_np.shape)
+                    k = int(self.rank_fraction * full_rank)
+                    k = max(1, k)
+                    
+                    Q_k = Q_np[:, :k]
+                    P_proj_np = Q_k @ Q_k.T
+                    self.projections[name] = torch.from_numpy(P_proj_np).float().to("cpu")
                 
                 # Convert back to Tensor
                 self.projections[name] = torch.from_numpy(P_proj_np).float().to("cpu") # Store on CPU
