@@ -105,12 +105,63 @@ class SVDProjector(SubspaceProjector):
 
 class QRProjector(SubspaceProjector):
     """
-    Implementation of Experiment 2 (QR Decomposition) [cite: 41-45].
+    Implementation of Experiment 4 (Pivoted QR Decomposition).
+    Uses Column Pivoted QR to select the most important basis vectors[cite: 41-45].
     """
-    def compute_subspaces(self, model):
-        # TODO: Implement torch.linalg.qr logic here
-        # TODO: Select first k columns of Q
-        pass
+    def __init__(self, rank_fraction=0.5):
+        super().__init__()
+        self.rank_fraction = rank_fraction
+        self.projections = {}
+
+    def compute_subspaces(self, model, dataloader=None, device='cpu'):
+        print("Computing QR subspaces (Pivoted)...")
+        # QR does not require data, only weights.
+        
+        for name, param in model.named_parameters():
+            if 'weight' in name and (param.dim() == 2 or param.dim() == 4):
+                # 1. Flatten to 2D
+                W = self._reshape_layer(param)
+                
+                # 2. Pivoted QR: W @ P = Q @ R
+                # 'pivot=True' ensures diagonal of R is sorted by magnitude
+                # mode='reduced' returns Q (M, K), R (K, N) where K = min(M, N)
+                Q, R, P_indices = torch.linalg.qr(W.to(device), mode='reduced', pivot=True)
+                
+                # 3. Determine Rank
+                full_rank = min(W.shape)
+                k = int(self.rank_fraction * full_rank)
+                k = max(1, k) # Keep at least 1
+                
+                # 4. Truncate Q
+                # Q columns correspond to the pivoted basis vectors
+                Q_k = Q[:, :k]
+                
+                # 5. Form Projection Matrix: P = Q_k @ Q_k^T
+                # This projects onto the column space of the top-k components
+                P_proj = torch.mm(Q_k, Q_k.t())
+                
+                self.projections[name] = P_proj.to("cpu") # Store on CPU to save GPU mem
+
+    def project_gradient(self, layer_name, grad):
+        if layer_name not in self.projections:
+            return grad
+            
+        P_proj = self.projections[layer_name].to(grad.device)
+        
+        # 1. Flatten Gradient
+        original_shape = grad.shape
+        grad_flat = self._reshape_layer(grad)
+        
+        # 2. Project onto Subspace
+        # grad_proj = P_proj @ grad_flat
+        grad_subspace = torch.matmul(P_proj, grad_flat)
+        
+        # 3. Orthogonal Projection (Remove subspace component)
+        # grad_clean = grad - grad_subspace
+        grad_clean = grad_flat - grad_subspace
+        
+        # 4. Reshape
+        return grad_clean.view(original_shape)
 
 class RSVDProjector(SubspaceProjector):
     """
