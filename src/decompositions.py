@@ -114,7 +114,9 @@ class QRProjector(SubspaceProjector):
         self.projections = {}
 
     def compute_subspaces(self, model, dataloader=None, device='cpu'):
-        print("Computing QR subspaces (Pivoted)...")
+        print("Computing QR subspaces (Pivoted) using Scipy...")
+        import scipy.linalg
+        
         # QR does not require data, only weights.
         
         for name, param in model.named_parameters():
@@ -123,24 +125,25 @@ class QRProjector(SubspaceProjector):
                 W = self._reshape_layer(param)
                 
                 # 2. Pivoted QR: W @ P = Q @ R
-                # 'pivot=True' ensures diagonal of R is sorted by magnitude
-                # mode='reduced' returns Q (M, K), R (K, N) where K = min(M, N)
-                Q, R, P_indices = torch.linalg.qr(W.to(device), mode='reduced', pivot=True)
+                # We use scipy.linalg.qr because torch.linalg.qr(pivot=True) is version-dependent
+                W_np = W.detach().cpu().numpy()
+                Q_np, R_np, P_indices = scipy.linalg.qr(W_np, mode='economic', pivoting=True)
                 
                 # 3. Determine Rank
-                full_rank = min(W.shape)
+                full_rank = min(W_np.shape)
                 k = int(self.rank_fraction * full_rank)
                 k = max(1, k) # Keep at least 1
                 
                 # 4. Truncate Q
                 # Q columns correspond to the pivoted basis vectors
-                Q_k = Q[:, :k]
+                Q_k = Q_np[:, :k]
                 
                 # 5. Form Projection Matrix: P = Q_k @ Q_k^T
                 # This projects onto the column space of the top-k components
-                P_proj = torch.mm(Q_k, Q_k.t())
+                P_proj_np = Q_k @ Q_k.T
                 
-                self.projections[name] = P_proj.to("cpu") # Store on CPU to save GPU mem
+                # Convert back to Tensor
+                self.projections[name] = torch.from_numpy(P_proj_np).float().to("cpu") # Store on CPU
 
     def project_gradient(self, layer_name, grad):
         if layer_name not in self.projections:
