@@ -164,13 +164,84 @@ class QRProjector(SubspaceProjector):
         # 4. Reshape
         return grad_clean.view(original_shape)
 
-class RSVDProjector(SubspaceProjector):
+class RSVDProjector(SVDProjector):
     """
     Implementation of Experiment 3 (Randomized SVD) [cite: 46-50].
+    Implements the Halko et al. (2011) algorithm for numerically stable RSVD.
+    Inherits project_gradient from SVDProjector as both use (U, V) storage.
     """
+    def __init__(self, rank_fraction=0.5, p=10, q=2):
+        super().__init__()
+        self.rank_fraction = rank_fraction
+        self.p = p # Oversampling parameter
+        self.q = q # Power iterations
+        self.projections = {}
+
     def compute_subspaces(self, model):
-        # TODO: Implement randomized SVD (using sklearn or torch approximation)
-        pass
+        self.projections = {}
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if 'weight' in name and (param.dim() == 2 or param.dim() == 4):
+                    # 1. Flatten to Matrix A (m x n)
+                    A = self._reshape_layer(param)
+                    m, n = A.shape
+                    
+                    # Determine target rank k
+                    k = int(min(m, n) * self.rank_fraction)
+                    k = max(1, k)
+                    
+                    # Oversampling size
+                    l = k + self.p
+                    if l > min(m, n):
+                        l = min(m, n)
+                    
+                    # --- Stage A: Range Finder ---
+                    
+                    # 1. Generate Gaussian Random Matrix Omega (n x l)
+                    Omega = torch.randn(n, l, device=A.device, dtype=A.dtype)
+                    
+                    # 2. Compute Sample Matrix Y = A @ Omega
+                    Y = torch.matmul(A, Omega)
+                    
+                    # 3. Power Iterations with QR Stabilization
+                    # Y = (A A^T)^q A Omega
+                    # We assume A is real, so A^H = A^T
+                    for _ in range(self.q):
+                        # Orthogonalize Y
+                        Q_Y, _ = torch.linalg.qr(Y)
+                        
+                        # Multiply by A^T
+                        Z = torch.matmul(A.T, Q_Y)
+                        
+                        # Orthogonalize Z
+                        Q_Z, _ = torch.linalg.qr(Z)
+                        
+                        # Multiply by A
+                        Y = torch.matmul(A, Q_Z)
+                    
+                    # 4. Final Orthonormal Basis Q
+                    Q, _ = torch.linalg.qr(Y)
+                    
+                    # --- Stage B: Direct SVD ---
+                    
+                    # 1. Project A to low-dimensional space B = Q^T @ A
+                    # dim: (l x m) @ (m x n) -> (l x n)
+                    B = torch.matmul(Q.T, A)
+                    
+                    # 2. Compute SVD of small matrix B
+                    # B is (l x n) which is small since l << m usually
+                    U_hat, S, Vh = torch.linalg.svd(B, full_matrices=False)
+                    
+                    # 3. Recover approximation of left singular vectors U = Q @ U_hat
+                    # dim: (m x l) @ (l x l) -> (m x l)
+                    U_approx = torch.matmul(Q, U_hat)
+                    
+                    # 4. Truncate to rank k
+                    U_keep = U_approx[:, :k]
+                    # Vh is (l x n), so V = Vh.T is (n x l)
+                    V_keep = Vh[:k, :].T
+                    
+                    self.projections[name] = (U_keep, V_keep)
 
 class MagnitudePruningProjector(SubspaceProjector):
     """
