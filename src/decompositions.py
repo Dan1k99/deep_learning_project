@@ -245,13 +245,81 @@ class RSVDProjector(SVDProjector):
 
 class MagnitudePruningProjector(SubspaceProjector):
     """
-    Baseline: Freezes weights based solely on magnitude. Serves as a control to test if geometric structure (SVD/QR) offers superior retention compared to simple sparsity.
+    Experiment 6: Global Unstructured Magnitude Pruning.
     """
+    def __init__(self, sparsity_target=0.5):
+        super().__init__()
+        self.sparsity_target = sparsity_target
+        self.projections = {} # Stores binary masks {layer_name: mask_tensor}
+
     def compute_subspaces(self, model):
-        # TODO: Implement magnitude-based pruning logic
-        # TODO: Identify indices of smallest weights (update) vs largest weights (freeze)
-        # TODO: Create binary mask instead of projection matrix
-        pass
+        import torch.nn.utils.prune as prune
+        
+        # 1. Gather all pruneable parameters
+        parameters_to_prune = []
+        for name, module in model.named_modules():
+            if isinstance(module, (nn.Linear, nn.Conv2d)):
+                parameters_to_prune.append((module, 'weight'))
+
+        print(f"Pruning {len(parameters_to_prune)} layers with Global Sparsity {self.sparsity_target*100:.1f}%...")
+
+        # 2. Apply Global Unstructured Pruning
+        # This modifies the weights in-place (creates weight_mask and weight_orig)
+        prune.global_unstructured(
+            parameters_to_prune,
+            pruning_method=prune.L1Unstructured,
+            amount=self.sparsity_target,
+        )
+
+        # 3. Store Masks & Make Permanent
+        self.projections = {}
+        total_zeros = 0
+        total_elements = 0
+        
+        for name, module in model.named_modules():
+            if isinstance(module, (nn.Linear, nn.Conv2d)):
+                # The mask effectively exists as (weight != 0) after pruning
+                # However, prune.global_unstructured creates a 'weight_mask' buffer.
+                # We can grab that for safety.
+                if hasattr(module, 'weight_mask'):
+                    mask = module.weight_mask.detach().clone()
+                    # Make pruning permanent (removes _mask and _orig, keeps pruned weight)
+                    prune.remove(module, 'weight')
+                else:
+                    # Fallback if something went wrong or re-running
+                    mask = (module.weight != 0).float()
+                
+                # Store mask for gradient projection
+                # Note: name in named_modules is 'layer1', but project_gradient uses 'layer1.weight'
+                # We need to map correctly. 
+                # decomposition.compute_subspaces iterates 'named_parameters'.
+                # trainer.py iterates 'named_parameters'.
+                # So we should store keys as "layer_name.weight".
+                
+                # Full parameter name
+                if name == "":
+                    # Top level (unlikely for conv/linear)
+                    param_name = "weight"
+                else:
+                    param_name = name + ".weight"
+                    
+                self.projections[param_name] = mask
+                
+                # Stats
+                zeros = (module.weight == 0).sum().item()
+                elems = module.weight.numel()
+                total_zeros += zeros
+                total_elements += elems
+
+        global_sparsity = total_zeros / total_elements
+        print(f"Global Sparsity Achieved: {global_sparsity*100:.2f}%")
+
+    def project_gradient(self, layer_name, grad):
+        # Apply mask to gradient: enforce zero gradient where weight is zero
+        if layer_name in self.projections:
+            mask = self.projections[layer_name].to(grad.device)
+            return grad * mask
+        return grad
 
 class AdaptiveSVDProjector(SVDProjector):
     """
