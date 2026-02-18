@@ -1,6 +1,6 @@
 # Sculpting Subspaces: Data-Free Gradient Projection
 
-![Project Hero](subspace_hero.png)
+![Project Hero](assets/subspace_hero.png)
 *> Note: 3D Visualization of Gradient Projection onto Null Subspace (Placeholder)*
 
 ### "Data-Free Gradient Projection for Continual Learning in CNNs."
@@ -21,7 +21,7 @@ We extend the standard Gradient Projection Memory (GPM) framework with several n
 ## 3. Benchmarks & Results
 Our experiments on Split-CIFAR-10 demonstrate that **Randomized SVD (RSVD)** yields the best trade-off between plasticity (learning new tasks) and retention (remembering old tasks), outperforming the Naive baseline significantly.
 
-![Leaderboard Graph](retention_leaderboard.png)
+![Leaderboard Graph](assets/retention_leaderboard.png)
 *> Benchmark: Average Retention Accuracy @ 4 Epochs (RSVD denotes highest performance)*
 
 **Key Findings:**
