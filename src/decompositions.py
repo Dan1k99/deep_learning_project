@@ -3,110 +3,117 @@ import torch.nn as nn
 
 class SubspaceProjector:
     """
-    Base class for all decomposition techniques.
-    Handles the storage of projection matrices.
+    Base class for all decomposition-based subspace projection techniques.
+    Maintains a dictionary of per-layer projection matrices computed during
+    the subspace identification phase.
     """
     def __init__(self, rank_threshold=0.95):
         self.rank_threshold = rank_threshold
-        self.projections = {} # Stores {layer_name: projection_matrix}
+        self.projections = {}  # Maps layer names to their corresponding projection matrices
 
     def _reshape_layer(self, tensor):
         """
-        Macro: Flattens 4D Conv tensors (Out, In, K, K) into 2D matrices[cite: 36].
+        Reshapes a weight tensor into a 2D matrix suitable for matrix decomposition.
+        4D Conv2d tensors of shape (Out, In, K, K) are flattened to (Out, In*K*K);
+        2D Linear tensors are returned unchanged.
         """
         if tensor.dim() == 4:
-            # Conv2d: (out_channels, in_channels, k, k) -> (out_channels, in_channels * k * k)
+            # Conv2d weights: (out_channels, in_channels, k, k) -> (out_channels, in_channels * k * k)
             return tensor.view(tensor.size(0), -1)
         elif tensor.dim() == 2:
-            # Linear: (out_features, in_features)
+            # Linear weights: (out_features, in_features), already in the required 2D form
             return tensor
         else:
             raise ValueError(f"Unsupported tensor dimension: {tensor.dim()}")
 
     def compute_subspaces(self, model):
         """
-        Macro: Iterates over model layers and computes the 'Safe Subspace' 
-        using the specific decomposition technique.
+        Abstract interface: iterates over model layers and populates self.projections
+        with the 'safe subspace' representation computed by the concrete subclass.
         """
         pass
 
     def project_gradient(self, layer_name, grad):
         """
-        Macro: Applies the projection constraint to the gradient[cite: 60].
-        formula: grad_clean = grad - projection_matrix @ grad
+        Abstract interface: applies the orthogonal projection constraint to a gradient tensor.
+        The projection removes the component of the gradient that lies within the
+        previously identified subspace, following: grad_clean = grad - P @ grad.
         """
         pass
 
 class SVDProjector(SubspaceProjector):
     """
-    Implementation of the Paper's Baseline (Standard SVD) [cite: 37-40].
+    Implements the paper's baseline subspace projection method using standard
+    Truncated Singular Value Decomposition (SVD). The retained subspace is
+    determined by an energy threshold that captures a specified fraction of
+    the total spectral energy of each weight matrix.
     """
     def compute_subspaces(self, model):
         self.projections = {}
         with torch.no_grad():
             for name, param in model.named_parameters():
-                # Process only .weight tensors of Linear and Conv2d layers
+                # Restricted to weight tensors of Conv2d and Linear layers
                 if 'weight' in name and (param.dim() == 2 or param.dim() == 4):
-                    # Flatten layer weights
+                    # Flattens the weight tensor to a 2D matrix for decomposition
                     W_flat = self._reshape_layer(param)
-                    
-                    # Perform SVD
-                    # full_matrices=False returns U (M, K), S (K), Vh (K, N) where K = min(M, N)
+
+                    # Computes the economy SVD; full_matrices=False yields
+                    # U (M, K), S (K,), Vh (K, N) where K = min(M, N)
                     U, S, Vh = torch.linalg.svd(W_flat, full_matrices=False)
-                    
-                    # Energy Selection
+
+                    # Computes the squared singular values (spectral energy per component)
                     S_sq = S ** 2
                     total_energy = torch.sum(S_sq)
                     cum_energy = torch.cumsum(S_sq, dim=0)
-                    
-                    # Find k such that cumulative energy >= 0.95 * total_energy
-                    # searchsorted returns the index where the value would be inserted to maintain order
+
+                    # Identifies the minimum rank k such that the cumulative energy
+                    # meets or exceeds the specified rank_threshold fraction of total energy
                     threshold_energy = total_energy * self.rank_threshold
                     k = torch.searchsorted(cum_energy, threshold_energy).item() + 1
-                    
-                    # Keep top k components
-                    # U: (M, K) -> (M, k)
-                    # Vh: (K, N) -> (k, N). Since V = Vh.T, V_keep = Vh[:k, :].T
+
+                    # Retains the top-k left and right singular vectors, which together
+                    # span the dominant subspace of the weight matrix.
+                    # U: (M, K) -> (M, k) | Vh: (K, N) -> V_keep: (N, k) via transposition
                     U_keep = U[:, :k]
                     V_keep = Vh[:k, :].T
-                    
+
                     self.projections[name] = (U_keep, V_keep)
 
     def project_gradient(self, layer_name, grad):
         if layer_name not in self.projections:
             return grad
-            
-        # U_keep: Left Singular Vectors (shape: Rows x Rank)
-        # V_keep: Right Singular Vectors (shape: Cols x Rank)
+
+        # U_keep: left singular vectors spanning the row subspace  (Rows x Rank)
+        # V_keep: right singular vectors spanning the column subspace (Cols x Rank)
         U_keep, V_keep = self.projections[layer_name]
-        
-        # 1. Flatten the gradient to a 2D matrix (shape: Rows x Cols)
+
+        # Flattens the gradient to a 2D matrix matching the decomposed weight shape
         original_shape = grad.shape
         grad_flat = self._reshape_layer(grad)
-        
-        # 2. Compute the "Core Subspace" component of the gradient (Step A)
-        # We project the gradient onto the basis defined by U and V.
-        # Math: U^T @ Grad @ V
-        # dims: (Rank, Rows) @ (Rows, Cols) @ (Cols, Rank) -> Result: (Rank, Rank)
+
+        # Projects the gradient onto the dominant subspace (Step A):
+        # computes the low-rank coordinate representation of the gradient.
+        # Math: U^T @ Grad @ V  |  dims: (Rank, Rows) @ (Rows, Cols) @ (Cols, Rank) -> (Rank, Rank)
         inner_term = torch.matmul(torch.matmul(U_keep.T, grad_flat), V_keep)
-        
-        # 3. Project that component back into the full weight space (Step B)
-        # This reconstructs the part of the gradient that lies in the "forbidden" subspace.
-        # Math: U @ Inner_Term @ V^T
-        # dims: (Rows, Rank) @ (Rank, Rank) @ (Rank, Cols) -> Result: (Rows, Cols)
+
+        # Reconstructs the forbidden subspace component in the full weight space (Step B):
+        # this is the portion of the gradient aligned with the Task A subspace.
+        # Math: U @ Inner_Term @ V^T  |  dims: (Rows, Rank) @ (Rank, Rank) @ (Rank, Cols) -> (Rows, Cols)
         forbidden_component = torch.matmul(torch.matmul(U_keep, inner_term), V_keep.T)
-        
-        # 4. Remove the forbidden component (Orthogonal Projection)
+
+        # Removes the forbidden component via orthogonal projection, yielding a gradient
+        # that is constrained to the complement of the Task A subspace.
         # Math: Grad_Final = Grad_Original - Grad_Forbidden
         grad_proj = grad_flat - forbidden_component
-        
-        # 5. Reshape back to original tensor dimensions (e.g., 4D for Conv layers)
+
+        # Restores the original tensor shape (e.g., 4D for Conv2d layers)
         return grad_proj.view(original_shape)
 
 class QRProjector(SubspaceProjector):
     """
-    Implementation of Experiment 4 (Pivoted QR Decomposition).
-    Uses Column Pivoted QR to select the most important basis vectors[cite: 41-45].
+    Implements subspace projection via Column-Pivoted QR Decomposition (Experiment 4).
+    Column pivoting reorders columns by decreasing importance, allowing the leading
+    columns of Q to span the most informative directions of the weight matrix.
     """
     def __init__(self, rank_fraction=0.5):
         super().__init__()
@@ -116,65 +123,68 @@ class QRProjector(SubspaceProjector):
     def compute_subspaces(self, model, dataloader=None, device='cpu'):
         print("Computing QR subspaces (Pivoted) using Scipy...")
         import scipy.linalg
-        
+
         for name, param in model.named_parameters():
             if 'weight' in name and (param.dim() == 2 or param.dim() == 4):
-                # 1. Flatten to 2D
+                # Flattens the weight tensor to a 2D matrix for decomposition
                 W = self._reshape_layer(param)
-                
-                # 2. Pivoted QR: W @ P = Q @ R
-                # We use scipy.linalg.qr because torch.linalg.qr(pivot=True) is version-dependent
+
+                # Applies column-pivoted QR via scipy.linalg.qr, which is used in preference
+                # to torch.linalg.qr as pivot support is version-dependent in PyTorch.
+                # Factorization: W @ P = Q @ R, where P is the column permutation.
                 W_np = W.detach().cpu().numpy()
                 Q_np, R_np, P_indices = scipy.linalg.qr(W_np, mode='economic', pivoting=True)
-                
-                # 3. Determine Rank
+
+                # Determines the truncation rank as a fixed fraction of the matrix's full rank
                 full_rank = min(W_np.shape)
                 k = int(self.rank_fraction * full_rank)
                 k = max(1, k)
-                
-                # 4. Truncate Q
+
+                # Retains the leading k columns of Q, which span the most important
+                # directions as ordered by the column pivot strategy
                 Q_k = Q_np[:, :k]
-                
-                # 5. Form Projection Matrix
+
+                # Constructs the orthogonal projection matrix P = Q_k @ Q_k^T,
+                # which projects any vector onto the retained k-dimensional subspace
                 P_proj_np = Q_k @ Q_k.T
-                
+
+                # Stores the projection matrix as a CPU-resident float tensor
                 self.projections[name] = torch.from_numpy(P_proj_np).float().to("cpu")
-                
-                # Convert back to Tensor
-                self.projections[name] = torch.from_numpy(P_proj_np).float().to("cpu") # Store on CPU
 
     def project_gradient(self, layer_name, grad):
         if layer_name not in self.projections:
             return grad
-            
+
         P_proj = self.projections[layer_name].to(grad.device)
-        
-        # 1. Flatten Gradient
+
+        # Flattens the gradient to a 2D matrix matching the decomposed weight shape
         original_shape = grad.shape
         grad_flat = self._reshape_layer(grad)
-        
-        # 2. Project onto Subspace
-        # grad_proj = P_proj @ grad_flat
+
+        # Projects the gradient onto the retained subspace: grad_subspace = P_proj @ grad_flat
         grad_subspace = torch.matmul(P_proj, grad_flat)
-        
-        # 3. Orthogonal Projection (Remove subspace component)
-        # grad_clean = grad - grad_subspace
+
+        # Removes the subspace-aligned component via orthogonal complement projection:
+        # grad_clean = grad - grad_subspace, constraining updates to the null space of the subspace
         grad_clean = grad_flat - grad_subspace
-        
-        # 4. Reshape
+
+        # Restores the original tensor shape
         return grad_clean.view(original_shape)
 
 class RSVDProjector(SVDProjector):
     """
-    Implementation of Experiment 3 (Randomized SVD) [cite: 46-50].
-    Implements the Halko et al. (2011) algorithm for numerically stable RSVD.
-    Inherits project_gradient from SVDProjector as both use (U, V) storage.
+    Implements subspace projection via Randomized SVD (Experiment 3),
+    following the Halko et al. (2011) algorithm for numerically stable
+    low-rank approximation. Power iterations are applied to sharpen the
+    approximation quality before the final SVD step.
+    Inherits project_gradient from SVDProjector, as both methods store
+    projections in the same (U_keep, V_keep) format.
     """
     def __init__(self, rank_fraction=0.5, p=10, q=2):
         super().__init__()
         self.rank_fraction = rank_fraction
-        self.p = p # Oversampling parameter
-        self.q = q # Power iterations
+        self.p = p  # Oversampling parameter: increases the probability of capturing the true range
+        self.q = q  # Number of power iterations: improves approximation accuracy for slowly decaying spectra
         self.projections = {}
 
     def compute_subspaces(self, model):
@@ -182,80 +192,83 @@ class RSVDProjector(SVDProjector):
         with torch.no_grad():
             for name, param in model.named_parameters():
                 if 'weight' in name and (param.dim() == 2 or param.dim() == 4):
-                    # 1. Flatten to Matrix A (m x n)
+                    # Flattens the weight tensor to a 2D matrix A of shape (m x n)
                     A = self._reshape_layer(param)
                     m, n = A.shape
-                    
-                    # Determine target rank k
+
+                    # Target rank k is set as a fraction of the matrix's smaller dimension
                     k = int(min(m, n) * self.rank_fraction)
                     k = max(1, k)
-                    
-                    # Oversampling size
+
+                    # Oversampled sketch size l = k + p; clamped to the matrix's rank
+                    # to avoid requesting more columns than the matrix can provide
                     l = k + self.p
                     if l > min(m, n):
                         l = min(m, n)
-                    
-                    # --- Stage A: Range Finder ---
-                    
-                    # 1. Generate Gaussian Random Matrix Omega (n x l)
+
+                    # --- Stage A: Randomized Range Finder ---
+
+                    # Draws a Gaussian random test matrix Omega of shape (n x l)
                     Omega = torch.randn(n, l, device=A.device, dtype=A.dtype)
-                    
-                    # 2. Compute Sample Matrix Y = A @ Omega
+
+                    # Forms the initial sample matrix Y = A @ Omega, approximating the range of A
                     Y = torch.matmul(A, Omega)
-                    
-                    # 3. Power Iterations with QR Stabilization
-                    # Y = (A A^T)^q A Omega
-                    # We assume A is real, so A^H = A^T
+
+                    # Applies q power iterations with alternating QR orthogonalization to
+                    # sharpen the range approximation; each iteration amplifies the dominant
+                    # singular directions relative to the smaller ones.
                     for _ in range(self.q):
-                        # Orthogonalize Y
+                        # Orthogonalizes Y to maintain numerical stability
                         Q_Y, _ = torch.linalg.qr(Y)
-                        
-                        # Multiply by A^T
+
+                        # Projects onto the row space of A via A^T
                         Z = torch.matmul(A.T, Q_Y)
-                        
-                        # Orthogonalize Z
+
+                        # Orthogonalizes Z before the next forward projection
                         Q_Z, _ = torch.linalg.qr(Z)
-                        
-                        # Multiply by A
+
+                        # Projects back onto the column space of A
                         Y = torch.matmul(A, Q_Z)
-                    
-                    # 4. Final Orthonormal Basis Q
+
+                    # Computes the final orthonormal basis Q approximating the range of A
                     Q, _ = torch.linalg.qr(Y)
-                    
-                    # --- Stage B: Direct SVD ---
-                    
-                    # 1. Project A to low-dimensional space B = Q^T @ A
-                    # dim: (l x m) @ (m x n) -> (l x n)
+
+                    # --- Stage B: Projected SVD ---
+
+                    # Projects A into the low-dimensional space: B = Q^T @ A
+                    # dims: (l x m) @ (m x n) -> (l x n); B is small since l << m typically
                     B = torch.matmul(Q.T, A)
-                    
-                    # 2. Compute SVD of small matrix B
-                    # B is (l x n) which is small since l << m usually
+
+                    # Computes the exact SVD of the small projected matrix B
                     U_hat, S, Vh = torch.linalg.svd(B, full_matrices=False)
-                    
-                    # 3. Recover approximation of left singular vectors U = Q @ U_hat
-                    # dim: (m x l) @ (l x l) -> (m x l)
+
+                    # Recovers the approximate left singular vectors of A: U_approx = Q @ U_hat
+                    # dims: (m x l) @ (l x l) -> (m x l)
                     U_approx = torch.matmul(Q, U_hat)
-                    
-                    # 4. Truncate to rank k
+
+                    # Truncates to the target rank k, retaining the dominant singular directions
                     U_keep = U_approx[:, :k]
-                    # Vh is (l x n), so V = Vh.T is (n x l)
+                    # Vh is (l x n); V_keep is obtained as the transpose of the first k rows
                     V_keep = Vh[:k, :].T
-                    
+
                     self.projections[name] = (U_keep, V_keep)
 
 class MagnitudePruningProjector(SubspaceProjector):
     """
-    Experiment 6: Global Unstructured Magnitude Pruning.
+    Implements gradient masking via Global Unstructured Magnitude Pruning (Experiment 6).
+    Weights with the smallest L1 magnitudes are zeroed out globally across all layers
+    to achieve a target sparsity level. The resulting binary mask is then applied to
+    gradients during Task B training, preventing updates to pruned weight positions.
     """
     def __init__(self, sparsity_target=0.5):
         super().__init__()
         self.sparsity_target = sparsity_target
-        self.projections = {} # Stores binary masks {layer_name: mask_tensor}
+        self.projections = {}  # Maps parameter names to binary sparsity masks
 
     def compute_subspaces(self, model):
         import torch.nn.utils.prune as prune
-        
-        # 1. Gather all pruneable parameters
+
+        # Collects all Conv2d and Linear weight tensors eligible for pruning
         parameters_to_prune = []
         for name, module in model.named_modules():
             if isinstance(module, (nn.Linear, nn.Conv2d)):
@@ -263,49 +276,43 @@ class MagnitudePruningProjector(SubspaceProjector):
 
         print(f"Pruning {len(parameters_to_prune)} layers with Global Sparsity {self.sparsity_target*100:.1f}%...")
 
-        # 2. Apply Global Unstructured Pruning
-        # This modifies the weights in-place (creates weight_mask and weight_orig)
+        # Applies global unstructured L1 pruning across all collected parameters simultaneously;
+        # the pruning threshold is determined globally so that the overall sparsity target is met.
+        # This operation modifies weights in-place, creating weight_mask and weight_orig buffers.
         prune.global_unstructured(
             parameters_to_prune,
             pruning_method=prune.L1Unstructured,
             amount=self.sparsity_target,
         )
 
-        # 3. Store Masks & Make Permanent
+        # Extracts and stores the binary masks, then makes pruning permanent by removing
+        # the auxiliary buffers and consolidating the pruned weights into the weight parameter.
         self.projections = {}
         total_zeros = 0
         total_elements = 0
-        
+
         for name, module in model.named_modules():
             if isinstance(module, (nn.Linear, nn.Conv2d)):
-                # The mask effectively exists as (weight != 0) after pruning
-                # However, prune.global_unstructured creates a 'weight_mask' buffer.
-                # We can grab that for safety.
                 if hasattr(module, 'weight_mask'):
                     mask = module.weight_mask.detach().clone()
-                    # Make pruning permanent (removes _mask and _orig, keeps pruned weight)
+                    # Finalizes pruning: removes the weight_mask and weight_orig buffers,
+                    # leaving only the pruned weight tensor in place.
                     prune.remove(module, 'weight')
                 else:
-                    # Fallback if something went wrong or re-running
+                    # Fallback for layers where the mask buffer is absent (e.g., on re-execution):
+                    # reconstructs the mask from the zero pattern of the current weight tensor.
                     mask = (module.weight != 0).float()
-                
-                # Store mask for gradient projection
-                # Note: name in named_modules is 'layer1', but project_gradient uses 'layer1.weight'
-                # We need to map correctly. 
-                # decomposition.compute_subspaces iterates 'named_parameters'.
-                # trainer.py iterates 'named_parameters'.
-                # So we should store keys as "layer_name.weight".
-                
-                # Full parameter name
+
+                # Stores the mask under the fully qualified parameter name (e.g., 'layer1.0.conv1.weight')
+                # to match the keys produced by model.named_parameters() in the training loop.
                 if name == "":
-                    # Top level (unlikely for conv/linear)
                     param_name = "weight"
                 else:
                     param_name = name + ".weight"
-                    
+
                 self.projections[param_name] = mask
-                
-                # Stats
+
+                # Accumulates sparsity statistics for the final diagnostic report
                 zeros = (module.weight == 0).sum().item()
                 elems = module.weight.numel()
                 total_zeros += zeros
@@ -315,7 +322,8 @@ class MagnitudePruningProjector(SubspaceProjector):
         print(f"Global Sparsity Achieved: {global_sparsity*100:.2f}%")
 
     def project_gradient(self, layer_name, grad):
-        # Apply mask to gradient: enforce zero gradient where weight is zero
+        # Enforces gradient sparsity by zeroing out gradient entries at pruned weight positions,
+        # ensuring that the optimizer cannot restore weights that were removed during pruning.
         if layer_name in self.projections:
             mask = self.projections[layer_name].to(grad.device)
             return grad * mask
@@ -323,131 +331,118 @@ class MagnitudePruningProjector(SubspaceProjector):
 
 class AdaptiveSVDProjector(SVDProjector):
     """
-    Adaptive SVD: Dynamically selects rank based on layer importance (Input-Output Similarity).
-    [Fix 2]: Normalizes importance scores across layers to avoid excessive rank dropping.
-    [Fix 3]: Safe defaults (mrr=0.4) to protect feature extraction capability.
+    Extends SVDProjector with a data-driven, layer-wise rank selection strategy.
+    The retained rank for each layer is determined by its input-output activation
+    similarity: layers that behave more like identity mappings (high cosine similarity
+    between input and output) are assigned a higher retention ratio, preserving more
+    of their subspace. Importance scores are normalized relative to the layer-wise mean
+    to prevent extreme rank collapse or inflation.
     """
     def __init__(self, mrr=0.4, trr=0.95):
         super().__init__()
-        self.mrr = mrr # Minimum Retention Ratio (floor)
-        self.trr = trr # Target Retention Ratio (ceiling)
+        self.mrr = mrr  # Minimum Retention Ratio: lower bound on the fraction of singular values retained
+        self.trr = trr  # Target Retention Ratio: upper bound, approached for the most important layers
         self.projections = {}
 
     def compute_subspaces(self, model, dataloader, device):
         self.projections = {}
-        
-        # --- Step A: Collect Raw Importance Scores ---
+
+        # --- Phase A: Activation-Based Importance Scoring ---
         raw_importance = {}
         hooks = []
         activations = {}
 
         def get_activation_hook(name):
             def hook(model, input, output):
-                # Input is a tuple, take first element
+                # Captures the input and output activations of each layer for a single forward pass
                 activations[name] = (input[0].detach(), output.detach())
             return hook
 
-        # 1. Register Hooks
+        # Registers forward hooks on all Conv2d and Linear layers to capture their activations
         for name, module in model.named_modules():
-            # We care about layers with weights that we decompose
             if isinstance(module, (nn.Linear, nn.Conv2d)):
-                # Note: We track module execution to get input/output
                 hooks.append(module.register_forward_hook(get_activation_hook(name + '.weight')))
 
-        # 2. Run Single Batch
+        # Executes a single forward pass on one batch to populate the activation dictionary;
+        # hooks are removed in the finally block to avoid side effects on subsequent passes.
         model.eval()
         try:
             with torch.no_grad():
-                # Get one batch
                 inputs, _ = next(iter(dataloader))
                 inputs = inputs.to(device)
                 model(inputs)
         finally:
-            # 3. Cleanup Hooks (CRITICAL)
             for h in hooks:
                 h.remove()
 
-        # 4. Compute Raw Similarity
+        # Computes the cosine similarity between input and output activations for each layer.
+        # For 4D CNN tensors, global average pooling reduces spatial dimensions before comparison.
         valid_scores = []
         for name, (X, Y) in activations.items():
-            # Handle Dimension Mismatches
-            # Spatial Matching for CNN
             if X.dim() == 4 and Y.dim() == 4:
-                # Global Avg Pool: (B, C, H, W) -> (B, C)
+                # Global average pooling: (B, C, H, W) -> (B, C), collapsing spatial dimensions
                 X_pooled = X.mean(dim=(2, 3))
                 Y_pooled = Y.mean(dim=(2, 3))
             else:
-                 X_pooled, Y_pooled = X, Y
-            
-            # Channel/Size Check
+                X_pooled, Y_pooled = X, Y
+
             if X_pooled.numel() == Y_pooled.numel():
                 X_flat = X_pooled.flatten().float()
                 Y_flat = Y_pooled.flatten().float()
-                
-                # Cosine Similarity: Range [-1, 1]
+
+                # Cosine similarity in [-1, 1]; its absolute value serves as the importance score,
+                # with higher values indicating that the layer preserves its input (identity-like behavior).
                 similarity = torch.nn.functional.cosine_similarity(X_flat.unsqueeze(0), Y_flat.unsqueeze(0)).item()
-                # High Similarity = High Importance (Identity mapping = Keep it)
                 imp = abs(similarity)
-                
+
                 raw_importance[name] = imp
                 valid_scores.append(imp)
             else:
-                # Mismatched channels (e.g. ResNet expansion)
-                # Mark as None for now, will fill with mean later
+                # Dimension mismatch (e.g., residual expansion layers): importance deferred to mean imputation
                 raw_importance[name] = None
-                
-        # --- Step B: Normalize & Calculate Rank ---
-        
-        # Calculate Mean of Valid Scores
+
+        # --- Phase B: Score Normalization and Rank Computation ---
+
+        # Computes the mean importance across all layers with valid scores;
+        # used as the normalization baseline and as a fallback for mismatched layers.
         if len(valid_scores) > 0:
             avg_importance = sum(valid_scores) / len(valid_scores)
         else:
-            avg_importance = 1.0 # Fallback safety
-            
+            avg_importance = 1.0  # Conservative fallback when no valid scores are available
+
         print(f"Adaptive SVD: Avg Importance = {avg_importance:.4f} (over {len(valid_scores)} matching layers)")
 
         with torch.no_grad():
             for name, param in model.named_parameters():
                 if name in raw_importance:
-                    # Retrieve & Normalize
                     raw = raw_importance[name]
                     if raw is None:
-                        # Fallback for mismatched dimensions: Use Average Importance
-                        # Ideally, these are critical transform layers, so average is a safe neutral stance.
-                        # One could argure for raw=1.0, but average preserves the distribution center.
-                        norm_imp = 1.0 
+                        # Assigns mean-normalized importance (norm_imp = 1.0) to dimension-mismatched layers,
+                        # placing them at the center of the retention ratio range as a neutral stance.
+                        norm_imp = 1.0
                     else:
-                        # Normalize: Relative importance compared to average
+                        # Normalizes each layer's importance relative to the population mean,
+                        # so that average layers receive a retention ratio near the midpoint of [mrr, trr].
                         norm_imp = raw / avg_importance
-                    
-                    # Calculate Adaptive Ratio
-                    # alpha = mrr + norm_imp * (trr - mrr)
-                    # Example: if norm_imp is 1.0 (average), we get something between mrr and trr?
-                    # Wait, if norm_imp is huge, we might exceed 1.0.
-                    # Formula logic: We want to scale [0, max_imp] -> [mrr, trr]
-                    # But the standard "Importance" papers usually use softmax or min-max normalization.
-                    # Given the user instruction: "final_importance[l] = raw_importance[l] / mean_importance"
-                    # And "r = mrr + final_importance[l] * (trr - mrr)"
-                    
-                    alpha = self.mrr + norm_imp * (self.trr - self.mrr)
-                    
-                    # Clip to bounds [mrr, 1.0]
-                    # Note: We effectively allow alpha > trr if importance is very high, 
-                    # but we cap it at 1.0 (Full Rank).
-                    alpha = max(self.mrr, min(alpha, 1.0))
-                    
-                    # print(f"Layer {name}: Raw={raw if raw else 'N/A'}, Norm={norm_imp:.2f}, Alpha={alpha:.2f}")
 
-                    # Flatten & SVD (Standard Logic)
+                    # Computes the adaptive retention ratio alpha via linear interpolation
+                    # between mrr and trr, scaled by the normalized importance score.
+                    # alpha is clamped to [mrr, 1.0] to enforce the minimum retention floor
+                    # and prevent exceeding full rank.
+                    alpha = self.mrr + norm_imp * (self.trr - self.mrr)
+                    alpha = max(self.mrr, min(alpha, 1.0))
+
+                    # Flattens the weight tensor and computes its full SVD
                     W_flat = self._reshape_layer(param)
                     U, S, Vh = torch.linalg.svd(W_flat, full_matrices=False)
-                    
-                    # Adaptive Rank Selection
+
+                    # Determines the number of singular vectors to retain based on the adaptive ratio,
+                    # bounded to [1, N_sv] to guarantee at least one component is always kept.
                     N_sv = len(S)
                     k = int(alpha * N_sv)
-                    k = max(1, min(k, N_sv)) # Safety Bounds
-                    
-                    # Construct Projection
+                    k = max(1, min(k, N_sv))
+
+                    # Stores the truncated left and right singular vectors as the layer's projection basis
                     U_keep = U[:, :k]
                     V_keep = Vh[:k, :].T
                     self.projections[name] = (U_keep, V_keep)
