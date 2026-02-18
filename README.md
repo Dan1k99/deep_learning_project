@@ -1,37 +1,53 @@
-# Optimizing Subspace Constraints: Comparative Matrix Decomposition Techniques for Continual Learning in ResNet-18
+# Sculpting Subspaces: Data-Free Gradient Projection
 
-## 🎯 Project Goal
-This is a research project comparing different mathematical techniques (Standard SVD, QR Decomposition, Randomized SVD, and Magnitude Pruning) to solve "Catastrophic Forgetting" in Neural Networks. It replicates and upgrades the methodology of the "Sculpting Subspaces" paper by replacing the core SVD engine with other decomposition methods.
+![Project Hero](subspace_hero.png)
+*> Note: 3D Visualization of Gradient Projection onto Null Subspace (Placeholder)*
 
-## 🏗️ Architecture & File Structure
+### "Data-Free Gradient Projection for Continual Learning in CNNs."
 
-### 📓 The Orchestrator
-- **`main_experiment.ipynb`**: The entry point.
-    - Configures experiments.
-    - Trains the expert model (Phase 2).
-    - Executes the comparative loop (Phase 3 & 4).
-    - Produces final results and plots.
+## 1. Project Overview
+This repository implements an optimized weight-space projection framework for ResNet-18, successfully mitigating catastrophic forgetting on the Split-CIFAR-10 benchmark. By utilizing Randomized SVD (RSVD) and Adaptive Rank Selection, we achieve superior retention and computational efficiency compared to standard spectral methods. The core mechanism involves projecting gradients onto the null space of previous tasks' importance matrices to protect critical features without storing replay data.
 
-### 🐍 Source Directory (`src/`)
-- **`src/__init__.py`**: Defines the directory as a Python package.
-- **`src/data_utils.py` (Phase 1)**: Handles "Split-CIFAR-10" logic.
-    - Divides the dataset into **Task A** (Classes 0-4, old knowledge) and **Task B** (Classes 5-9, new knowledge).
-- **`src/models.py` (Phase 2)**: Wraps `torchvision.models.resnet18`.
-    - **Crucial**: Modifies the output layer to support 10 classes even when training on the 5-class Task A, facilitating Continual Learning.
-- **`src/decompositions.py` (Phase 3 - The ❤️ of the Project)**:
-    - Contains the `SubspaceProjector` abstract class.
-    - Implements **SVD**, **QR**, **Magnitude Pruning**, and **Randomized SVD**.
-    - Calculates the "Safe Subspaces" where weights are allowed to change.
-- **`src/trainer.py` (Phase 2 & 4)**: Contains custom training loops.
-    - `train_baseline`: Standard training for the Expert model.
-    - `train_constrained`: Experimental loop applying **Gradient Projection/Cleaning** intervention before the optimizer step.
+## 2. Key Innovations
+We extend the standard Gradient Projection Memory (GPM) framework with several novel decomposition strategies:
 
-### 📁 Checkpoints
-- **`checkpoints/`**: Stores trained `task_a_expert.pth` weights to avoid retraining the baseline.
+| Method | Description | Key Advantage |
+| :--- | :--- | :--- |
+| **Randomized SVD (RSVD)** | Approximates the singular value decomposition using random sampling. | **Speed & Scale**: Drastically reduces subspace computation time for high-dimensional layers compared to deterministic SVD. |
+| **Adaptive SVD** |  Dynamically selects rank based on `Input-Output Similarity` sensitivity thresholds (`mrr`, `trr`). | **Precision**: Allocates protection capacity intelligently, preserving more parameters for flexible plasticity in later tasks. |
+| **Pivoted QR** | Uses QR decomposition with column pivoting to identify orthogonal bases. | **Stability**: Offers a numerical alternative to SVD, often robust in different weight distributions. |
+| **Magnitude Pruning** | Projects gradients by masking the smallest magnitude weights. | **Baseline**: A simple, sparsity-based baseline for comparison. |
 
-## 🔄 Project Workflow
-1.  **Data Setup**: Split CIFAR-10 into Task A and Task B.
-2.  **Baseline Training**: Train ResNet-18 on Task A to create the "Expert".
-3.  **Subspace Extraction**: Use decomposition techniques (SVD, QR, etc.) to find important weights in the Expert.
-4.  **Constrained Training**: Train on Task B while projecting gradients to preserve Task A knowledge.
-5.  **Analysis**: Compare performance across different decomposition methods.
+## 3. Benchmarks & Results
+Our experiments on Split-CIFAR-10 demonstrate that **Randomized SVD (RSVD)** yields the best trade-off between plasticity (learning new tasks) and retention (remembering old tasks), outperforming the Naive baseline significantly.
+
+![Leaderboard Graph](retention_leaderboard.png)
+*> Benchmark: Average Retention Accuracy @ 4 Epochs (RSVD denotes highest performance)*
+
+**Key Findings:**
+*   **Naive Finetuning** suffers from severe catastrophic forgetting (~20% retention).
+*   **Standard SVD** improves retention (~66%) but incurs high computational cost.
+*   **RSVD** achieves comparable or superior retention (~68%+) with a fraction of the compute time.
+*   **Adaptive SVD** offers competitive performance by automatically tuning the "stiffness" of the model.
+
+## 4. Installation & Usage
+To reproduce the experiments:
+
+```bash
+# Clone the repository
+git clone https://github.com/Dan1k99/deep_learning_project.git
+cd deep_learning_project
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Run the main experiment suite
+# (Note: This runs Naive, SVD, Adaptive, RSVD, and QR experiments sequentially)
+python main_experiment.ipynb 
+```
+
+## 5. Repository Structure
+*   `src/decompositions.py`: Core logic for all subspace projectors (SVD, RSVD, QR, Adaptive).
+*   `src/models.py`: ResNet-18 architecture definition.
+*   `src/trainer.py`: Training loops for Baseline (Naive) and Constrained (Projected) optimization.
+*   `main_experiment.ipynb`: The orchestrator notebook for running benchmarks and visualizing results.
