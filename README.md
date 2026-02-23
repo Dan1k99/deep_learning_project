@@ -19,16 +19,15 @@ We extend the standard Gradient Projection Memory (GPM) framework with several n
 | **Magnitude Pruning** | Projects gradients by masking the smallest magnitude weights. | **Baseline**: A simple, sparsity-based baseline for comparison. |
 
 ## 3. Benchmarks & Results
-Our experiments on Split-CIFAR-10 demonstrate that **Randomized SVD (RSVD)** yields the best trade-off between plasticity (learning new tasks) and retention (remembering old tasks), outperforming the Naive baseline significantly.
+Our experiments on Split-CIFAR-10 evaluate the effectiveness of gradient projection in mitigating catastrophic forgetting. The results below compare the standard baseline with our optimized decomposition strategies, focusing on retention and computational efficiency.
 
-![Leaderboard Graph](assets/retention_leaderboard.png)
-*> Benchmark: Average Retention Accuracy @ 4 Epochs (RSVD denotes highest performance)*
+![Leaderboard Graph](assets/3avg.png)
+*> Benchmark: Average Performance across Split-CIFAR-10 tasks (Comparing Naive, Adaptive SVD, and RSVD)*
 
 **Key Findings:**
-*   **Naive Finetuning** suffers from severe catastrophic forgetting (~20% retention).
-*   **Standard SVD** improves retention (~66%) but incurs high computational cost.
-*   **RSVD** achieves comparable or superior retention (~68%+) with a fraction of the compute time.
-*   **Adaptive SVD** offers competitive performance by automatically tuning the "stiffness" of the model.
+*   **Naive Finetuning** suffers from severe catastrophic forgetting, with accuracy dropping significantly as new tasks are learned.
+*   **Adaptive SVD** demonstrates superior precision by intelligently allocating rank based on layer sensitivity, preserving more knowledge than static thresholds.
+*   **RSVD** achieves the best trade-off between speed and performance, providing near-optimal retention with significantly lower computational overhead than deterministic SVD.
 
 ## 4. Installation & Usage
 To reproduce the experiments:
@@ -42,12 +41,12 @@ cd deep_learning_project
 pip install -r requirements.txt
 
 # Run the main experiment suite
-# (Note: This runs Naive, SVD, Adaptive, RSVD, and QR experiments sequentially)
-python main_experiment.ipynb 
+# (Note: This runs the benchmark comparing Naive, Adaptive SVD, and RSVD)
+jupyter notebook main_experiment_1.ipynb 
 ```
 
 ## 5. Repository Structure
 *   `src/decompositions.py`: Core logic for all subspace projectors (SVD, RSVD, QR, Adaptive).
 *   `src/models.py`: ResNet-18 architecture definition.
 *   `src/trainer.py`: Training loops for Baseline (Naive) and Constrained (Projected) optimization.
-*   `main_experiment.ipynb`: The orchestrator notebook for running benchmarks and visualizing results.
+*   `main_experiment_1.ipynb`: The orchestrator notebook for running benchmarks and generating the comparative leaderboard.
